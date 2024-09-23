@@ -39,7 +39,7 @@ public partial class GenericDeepCloneableTest
         {
             Value = mapper0.Invoke(original.Value);
         }
-        public ReferenceWithGenericSourceGenerator<T> DeepClone(Func<T, T> arg1)
+        public ReferenceWithGenericSourceGenerator<T> DeepClone(Func<T, T> arg1, Dictionary<object, object>? cache = null)
         {
             return new ReferenceWithGenericSourceGenerator<T>(this, arg1);
         }

@@ -5,14 +5,14 @@ namespace DeepCloneGenerator;
 
 public class CloneGeneratorContext
 {
-    private readonly IReadOnlyCollection<INamedTypeSymbol> _classSymbols;
+    private readonly List<(INamedTypeSymbol Symbol, bool SkipDefaultConstructorGeneration)> _classSymbols;
 
-    public CloneGeneratorContext(IReadOnlyCollection<INamedTypeSymbol> classSymbols, Compilation compilation)
+    public CloneGeneratorContext(List<(INamedTypeSymbol Symbol, bool SkipDefaultConstructorGeneration)> classSymbols, Compilation compilation)
     {
         _classSymbols = classSymbols;
         Compilation = compilation;
         var classesInAssemblyGeneratingClone = classSymbols
-            .Select(c => c.ToDisplayString())
+            .Select(c => c.Symbol.ToDisplayString())
             .ToImmutableHashSet();
         ClassesInAssemblyGeneratingClone = classesInAssemblyGeneratingClone;
     }
@@ -24,7 +24,7 @@ public class CloneGeneratorContext
     {
         foreach (var classSymbol in _classSymbols)
         {
-            using var classContext = new CloneGeneratorClassContext(this, classSymbol);
+            using var classContext = new CloneGeneratorClassContext(this, classSymbol.Symbol,classSymbol.SkipDefaultConstructorGeneration);
             classContext.Do(ref ctx);
         }
     }

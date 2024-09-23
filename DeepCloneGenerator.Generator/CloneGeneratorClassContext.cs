@@ -1,4 +1,6 @@
 ﻿using System.CodeDom.Compiler;
+using System.Composition;
+using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using static DeepCloneGenerator.CloneGenerator;
@@ -8,6 +10,7 @@ namespace DeepCloneGenerator;
 public class CloneGeneratorClassContext : IDisposable
 {
     private readonly INamedTypeSymbol _classSymbol;
+    private readonly bool _classSymbolSkipDefaultConstructorGeneration;
     private readonly CloneGeneratorContext _context;
     private readonly HashSet<string> _mandatoryNamespaces = new();
     private readonly StringWriter _stringWriter;
@@ -19,10 +22,12 @@ public class CloneGeneratorClassContext : IDisposable
 
     private int _recursionDepth;
 
-    public CloneGeneratorClassContext(CloneGeneratorContext context, INamedTypeSymbol classSymbol)
+    public CloneGeneratorClassContext(CloneGeneratorContext context, INamedTypeSymbol classSymbol,
+        bool classSymbolSkipDefaultConstructorGeneration)
     {
         _context = context;
         _classSymbol = classSymbol;
+        _classSymbolSkipDefaultConstructorGeneration = classSymbolSkipDefaultConstructorGeneration;
         _stringWriter = new StringWriter();
         var writer = new IndentedTextWriter(_stringWriter);
         _writer = writer;
@@ -83,7 +88,8 @@ public class CloneGeneratorClassContext : IDisposable
         {
             if (_classSymbol.IsGenericType)
             {
-                _writer.WriteLine($": {Namespace}.{GenericInterfaceName}<{typeName}, {string.Join(", ", _classSymbol.TypeArguments.Select(c => c.Name))}>");
+                _writer.WriteLine(
+                    $": {Namespace}.{GenericInterfaceName}<{typeName}, {string.Join(", ", _classSymbol.TypeArguments.Select(c => c.Name))}>");
             }
             else
             {
@@ -97,7 +103,7 @@ public class CloneGeneratorClassContext : IDisposable
         var hasCtorDefined = HasCtorDefined(_classSymbol);
         _writer.WriteParameterValue(hasCtorDefined, nameof(hasCtorDefined));
 
-        if (!HasCtorDefined(_classSymbol))
+        if (!HasCtorDefined(_classSymbol) && !_classSymbolSkipDefaultConstructorGeneration)
         {
             _writer.WriteLine($"public {simpleTypeName}() {{ }}");
             _writer.WriteLine();
@@ -114,10 +120,14 @@ public class CloneGeneratorClassContext : IDisposable
         var ctorAccessibility = _classSymbol.IsSealed
             ? "private"
             : "protected";
-        _writer.Write($"{ctorAccessibility} {simpleTypeName}({typeName} {CtorVariableName}");
+        _writer.Write(
+            $"{ctorAccessibility} {simpleTypeName}({typeName} {CtorVariableName}, {CacheDictionaryType} {CacheDictionaryName}");
 
         ForEachTypeArgument(
-            (typeArgument, index) => { _writer.Write($", {GenericTypeMapperType(typeArgument)} {GenericTypeMapperArgumentName(index)}"); }
+            (typeArgument, index) =>
+            {
+                _writer.Write($", {GenericTypeMapperType(typeArgument)} {GenericTypeMapperArgumentName(index)}");
+            }
         );
 
         _writer.WriteLine(value: ')');
@@ -133,9 +143,16 @@ public class CloneGeneratorClassContext : IDisposable
             WriteBaseCloneableInvocation(CtorVariableName, baseClass!);
             _writer.Indent--;
         }
+        else if (type == "record")
+        {
+            _writer.Indent++;
+            _writer.WriteLine($": this({CtorVariableName})");
+            _writer.Indent--;
+        }
 
         _writer.WriteLine(value: '{');
         _writer.Indent++;
+        WriteCacheAssignment(CtorVariableName, "this");
         var nonCompilerGeneratedMembers = _classSymbol.GetMembers()
             .Where(symbol => symbol.CanBeReferencedByName);
 
@@ -144,12 +161,14 @@ public class CloneGeneratorClassContext : IDisposable
             while (baseClass is not null)
             {
                 var accessibleBaseClassMembers = baseClass.GetMembers()
-                    .Where(symbol => symbol.CanBeReferencedByName && symbol.DeclaredAccessibility is not Accessibility.Private);
+                    .Where(symbol =>
+                        symbol.CanBeReferencedByName && symbol.DeclaredAccessibility is not Accessibility.Private);
                 nonCompilerGeneratedMembers = nonCompilerGeneratedMembers.Concat(accessibleBaseClassMembers);
                 baseClass = baseClass.BaseType;
             }
         }
 
+        bool cacheVariableAlreadyDeclared = false;
         foreach (var member in nonCompilerGeneratedMembers)
         {
             if (member.GetAttributes()
@@ -166,16 +185,17 @@ public class CloneGeneratorClassContext : IDisposable
             switch (member, syntaxNode)
             {
                 case (IFieldSymbol { CanBeReferencedByName: true, Type: var returnType, IsConst: false } field, _):
-                    WriteAssignment(field, returnType);
+                    WriteAssignment(field, returnType, ref cacheVariableAlreadyDeclared);
                     break;
-                case (IPropertySymbol { Type: var returnType, IsAbstract: false } propertySymbol, PropertyDeclarationSyntax
-                {
-                    AccessorList: not null
-                }):
+                case (IPropertySymbol { Type: var returnType, IsAbstract: false } propertySymbol,
+                    PropertyDeclarationSyntax
+                    {
+                        AccessorList: not null
+                    }):
                 {
                     if (propertySymbol.IsAutoProperty())
                     {
-                        WriteAssignment(propertySymbol, returnType);
+                        WriteAssignment(propertySymbol, returnType, ref cacheVariableAlreadyDeclared);
                     }
 
                     break;
@@ -183,7 +203,7 @@ public class CloneGeneratorClassContext : IDisposable
                 case (IPropertySymbol { Type: var returnType, IsAbstract: false } propertySymbol, ParameterSyntax):
                     if (propertySymbol.IsAutoProperty())
                     {
-                        WriteAssignment(propertySymbol, returnType);
+                        WriteAssignment(propertySymbol, returnType, ref cacheVariableAlreadyDeclared);
                     }
 
                     break;
@@ -199,37 +219,47 @@ public class CloneGeneratorClassContext : IDisposable
         _writer.WriteLine(value: '}');
         _writer.WriteLine();
 
-        if (!_classSymbol.IsAbstract)
-        {
-            _writer.Write("public ");
-
-            if (type == "class" && !_classSymbol.IsGenericType)
+        var genericTypeArguments = "";
+        ForEachTypeArgument(
+            (typeArgument, index) =>
             {
-                _writer.Write(
-                    hasBaseClass && isBaseClassDeepCloneable && baseClass?.IsAbstract is not true
-                    && baseClass?.TypeArguments.Length == _classSymbol.TypeArguments.Length
-                        ? "override "
-                        : "virtual "
-                );
+                genericTypeArguments +=
+                    $"{GenericTypeMapperType(typeArgument)} {GenericTypeMapperArgumentName(index)}, ";
             }
+        );
 
-            _writer.Write($"{typeName} {CloneMethodName}(");
+        _writer.Write("public ");
 
-            ForEachTypeArgument(
-                (typeArgument, index) =>
-                {
-                    if (index > 0)
-                    {
-                        _writer.Write(", ");
-                    }
-
-                    _writer.Write($"{GenericTypeMapperType(typeArgument)} {GenericTypeMapperArgumentName(index)}");
-                }
+        if (type == "class" && !_classSymbol.IsGenericType)
+        {
+            _writer.Write(
+                hasBaseClass && isBaseClassDeepCloneable
+                             && baseClass?.TypeArguments.Length == _classSymbol.TypeArguments.Length
+                    ? "override "
+                    : "virtual "
             );
-            _writer.WriteLine(value: ')');
-            _writer.WriteLine(value: '{');
+        }
+
+        _writer.WriteLine(
+            $"{typeName} {CloneMethodName}({genericTypeArguments}{CacheDictionaryParameter})");
+        _writer.WriteLine(value: '{');
+        _writer.Indent++;
+        if (_classSymbol.IsAbstract)
+        {
+            _writer.Write($"return DeepClone(");
+            WriteGenericMapperParameters(_classSymbol);
+            _writer.WriteLine($"{CacheDictionaryName});");
+        }
+        else
+        {
+            _writer.WriteLine($"{CacheDictionaryName} ??= new {CacheDictionaryType}();");
+            _writer.WriteLine($"if({CacheDictionaryName}.TryGetValue(this, out var cachedClone))");
+            _writer.WriteLine("{");
             _writer.Indent++;
-            _writer.Write($"return new {typeName}(this");
+            _writer.WriteLine($"return ({typeName})cachedClone;");
+            _writer.Indent--;
+            _writer.WriteLine("}");
+            _writer.Write($"return new {typeName}(this, {CacheDictionaryName}");
             ForEachTypeArgument(
                 (_, index) =>
                 {
@@ -238,8 +268,51 @@ public class CloneGeneratorClassContext : IDisposable
                 }
             );
             _writer.WriteLine(");");
+        }
+
+        _writer.Indent--;
+        _writer.WriteLine(value: '}');
+
+        if (baseClass?.IsAbstract is true && isBaseClassDeepCloneable)
+        {
+            var genericBaseTypeArguments = "";
+            ForEachTypeArgument(baseClass,
+                (typeArgument, index) =>
+                {
+                    genericBaseTypeArguments +=
+                        $"{GenericTypeMapperType(typeArgument)} {GenericTypeMapperArgumentName(index)}, ";
+                }
+            );
+
+            _writer.WriteLine(
+                $"protected override {baseClass} {CloneMethodName}{baseClass.Name}({genericBaseTypeArguments}{CacheDictionaryParameter})");
+            _writer.WriteLine(value: '{');
+            _writer.Indent++;
+
+            var calledMethodName = _classSymbol.IsAbstract ? $"DeepClone{_classSymbol.Name}" : "DeepClone";
+
+            _writer.Write($"return {calledMethodName}(");
+            WriteGenericMapperParameters(_classSymbol);
+            _writer.WriteLine($"{CacheDictionaryName});");
+
             _writer.Indent--;
             _writer.WriteLine(value: '}');
+        }
+
+        if (_classSymbol.IsAbstract)
+        {
+            _writer.Write("protected abstract ");
+
+            _writer.Write($"{typeName} {CloneMethodName}{_classSymbol.Name}(");
+
+            ForEachTypeArgument(
+                (typeArgument, index) =>
+                {
+                    _writer.Write(
+                        $"{GenericTypeMapperType(typeArgument)} {GenericTypeMapperArgumentName(index)}, ");
+                }
+            );
+            _writer.WriteLine($"{CacheDictionaryParameter});");
         }
 
         _writer.Indent--;
@@ -276,15 +349,15 @@ public class CloneGeneratorClassContext : IDisposable
     {
         if (namedTypeSymbol.TypeArguments.Length == 0)
         {
-            _writer.WriteLine($": base({ctorVariableName})");
+            _writer.WriteLine($": base({ctorVariableName}, {CacheDictionaryName})");
             return;
         }
 
-        _writer.Write($": base({ctorVariableName}");
+        _writer.Write($": base({ctorVariableName}, {CacheDictionaryName}");
 
         for (var i = 0; i < namedTypeSymbol.TypeArguments.Length; i++)
         {
-            _writer.WriteLine($", static mapper{i} =>");
+            _writer.WriteLine($", mapper{i} =>");
             _writer.WriteLine(value: '{');
             _writer.Indent++;
             var variableName = WriteCloneLogic($"mapper{i}", namedTypeSymbol.TypeArguments[i]);
@@ -296,16 +369,34 @@ public class CloneGeneratorClassContext : IDisposable
         _writer.WriteLine(value: ')');
     }
 
-    private void ForEachTypeArgument(Action<ITypeSymbol, int> callback)
+    private void WriteGenericMapperParameters(INamedTypeSymbol namedTypeSymbol)
     {
-        if (!_classSymbol.IsGenericType)
+        if (namedTypeSymbol.TypeArguments.Length == 0)
         {
             return;
         }
 
-        for (var index = 0; index < _classSymbol.TypeArguments.Length; index++)
+        for (var i = 0; i < namedTypeSymbol.TypeArguments.Length; i++)
         {
-            var typeArgument = _classSymbol.TypeArguments[index];
+            _writer.WriteLine($"obj => obj, ");
+        }
+    }
+
+    private void ForEachTypeArgument(Action<ITypeSymbol, int> callback)
+    {
+        ForEachTypeArgument(_classSymbol, callback);
+    }
+
+    private static void ForEachTypeArgument(INamedTypeSymbol symbol, Action<ITypeSymbol, int> callback)
+    {
+        if (!symbol.IsGenericType)
+        {
+            return;
+        }
+
+        for (var index = 0; index < symbol.TypeArguments.Length; index++)
+        {
+            var typeArgument = symbol.TypeArguments[index];
             callback.Invoke(typeArgument, index);
         }
     }
@@ -323,7 +414,13 @@ public class CloneGeneratorClassContext : IDisposable
     private bool TryGetBaseClass(out INamedTypeSymbol? namedTypeSymbol)
     {
         // object is the only type without a base type, so if this is object this will not match
-        if (_classSymbol is { BaseType: { ContainingNamespace.Name: not "System", Name: not "Object" and not "ValueType" } actualBaseType })
+        if (_classSymbol is
+            {
+                BaseType:
+                {
+                    ContainingNamespace.Name: not "System", Name: not "Object" and not "ValueType"
+                } actualBaseType
+            })
         {
             namedTypeSymbol = actualBaseType;
             return true;
@@ -352,16 +449,56 @@ public class CloneGeneratorClassContext : IDisposable
         return linkedList;
     }
 
-    private void WriteAssignment(ISymbol symbol, ITypeSymbol returnType)
+    private void WriteAssignment(ISymbol symbol, ITypeSymbol returnType, ref bool cacheVariableAlreadyDeclared)
     {
         var variableName = $"{CtorVariableName}.{symbol.Name}";
 
+        var useCache = returnType.IsReferenceType && returnType.SpecialType != SpecialType.System_String;
+        if (useCache)
+        {
+            if (!cacheVariableAlreadyDeclared)
+            {
+                _writer.WriteLine();
+                _writer.WriteLine("object? cachedClone;");
+                _writer.WriteLine();
+                cacheVariableAlreadyDeclared = true;
+            }
+
+            // ToString for multidimensional arrays produces "int[*,*]" instead of "int[,]", so we need to replace the asterisk
+            var castTargetType = returnType is IArrayTypeSymbol
+                ? returnType.ToString().Replace("*", "")
+                : returnType.ToString();
+
+            _writer.WriteLine(
+                $"if({variableName} is not null && {CacheDictionaryName}.TryGetValue({variableName}, out cachedClone))");
+            _writer.WriteLine("{");
+            _writer.Indent++;
+            _writer.WriteLine($"this.{symbol.Name} = ({castTargetType})cachedClone;");
+            _writer.Indent--;
+            _writer.WriteLine("}");
+            _writer.WriteLine("else");
+            _writer.WriteLine("{");
+            _writer.Indent++;
+        }
+
         var variableNameToAssign = WriteCloneLogic(variableName, returnType);
+
         _writer.Write("this.");
         _writer.Write(symbol.Name);
         _writer.Write(" = ");
         _writer.Write(variableNameToAssign);
         _writer.WriteLine(value: ';');
+
+        if (useCache)
+        {
+            _writer.Indent--;
+            _writer.WriteLine("}");
+        }
+    }
+
+    private void WriteCacheAssignment(string originalVariable, string cloneVariable)
+    {
+        _writer.WriteLine($"{CacheDictionaryName}[{originalVariable}] = {cloneVariable};");
     }
 
     private string NextUniqueVariableName()
@@ -416,7 +553,7 @@ public class CloneGeneratorClassContext : IDisposable
 
         if (IsEnumerableType(returnType, out var enumerableType))
         {
-            return WriteEnumerableClone($"(({enumerableType!.ToDisplayString()}){variableName})", enumerableType);
+            return WriteEnumerableClone(variableName, enumerableType!);
         }
 
         if (returnType is ITypeParameterSymbol typeParameter)
@@ -432,16 +569,18 @@ public class CloneGeneratorClassContext : IDisposable
 
         if (IsTypeDeepCloneable(returnType))
         {
+            _writer.WriteDebugCommentLine("Calling DeepClone on the type");
             var isNullableType = returnType.NullableAnnotation is not NullableAnnotation.NotAnnotated;
             return isNullableType
-                ? $"{variableName}?.{CloneMethodName}()"
-                : $"{variableName}.{CloneMethodName}()";
+                ? $"{variableName}?.{CloneMethodName}({CacheDictionaryName})"
+                : $"{variableName}!.{CloneMethodName}({CacheDictionaryName})";
         }
 
         return variableName;
     }
 
-    private string WriteGenericDeepCloneLogic(string variableName, ITypeSymbol returnType, INamedTypeSymbol implementedInterface)
+    private string WriteGenericDeepCloneLogic(string variableName, ITypeSymbol returnType,
+        INamedTypeSymbol implementedInterface)
     {
         _writer.WriteDebugCommentLine($"{implementedInterface.ToDisplayString()} detected");
         IEnumerable<ITypeSymbol> typeArguments = implementedInterface.TypeArguments;
@@ -457,7 +596,7 @@ public class CloneGeneratorClassContext : IDisposable
         {
             var mapper = NextUniqueVariableName();
             var mapperArgument = NextUniqueVariableName();
-            _writer.WriteLine($"var {mapper} = static ({typeArgument.ToDisplayString()} {mapperArgument}) =>");
+            _writer.WriteLine($"var {mapper} = ({typeArgument.ToDisplayString()} {mapperArgument}) =>");
             _writer.WriteLine(value: '{');
             _writer.Indent++;
             var cloneVariableName = WriteCloneLogic(mapperArgument, typeArgument);
@@ -469,9 +608,10 @@ public class CloneGeneratorClassContext : IDisposable
 
         var nullCoalescentOperator = returnType.NullableAnnotation is not NullableAnnotation.NotAnnotated
             ? "?"
-            : string.Empty;
+            : "!";
 
-        return $"{variableName}{nullCoalescentOperator}.DeepClone({string.Join(", ", typeArgumentsVariables)})";
+        return
+            $"{variableName}{nullCoalescentOperator}.{CloneMethodName}({string.Join(", ", typeArgumentsVariables.Concat(new[] { CacheDictionaryName }))})";
     }
 
     private bool IsGenericDeepCloneable(ITypeSymbol returnType, out INamedTypeSymbol? typeSymbol)
@@ -504,15 +644,18 @@ public class CloneGeneratorClassContext : IDisposable
         // }
         var typeName = type.ToDisplayString();
         return _context.ClassesInAssemblyGeneratingClone.Contains(typeName)
-            || type.AllInterfaces.Any(c => c.Name == InterfaceName)
-            || (!type.Equals(type.OriginalDefinition, SymbolEqualityComparer.Default)
-                && type.OriginalDefinition is INamedTypeSymbol { TypeArguments.Length: > 0 } && IsTypeDeepCloneable(type.OriginalDefinition));
+               || type.AllInterfaces.Any(c => c.Name == InterfaceName)
+               || (!type.Equals(type.OriginalDefinition, SymbolEqualityComparer.Default)
+                   && type.OriginalDefinition is INamedTypeSymbol { TypeArguments.Length: > 0 } &&
+                   IsTypeDeepCloneable(type.OriginalDefinition));
     }
 
-    private string WriteDictionaryClone(string variableName, INamedTypeSymbol collectionType, ITypeSymbol keyType, ITypeSymbol valueType)
+    private string WriteDictionaryClone(string variableName, INamedTypeSymbol collectionType, ITypeSymbol keyType,
+        ITypeSymbol valueType)
     {
         var variableNameToAssign = NextUniqueVariableName();
-        _writer.WriteLine($"var {variableNameToAssign} = new {collectionType.ToDisplayString()}();");
+        _writer.WriteLine($"var {variableNameToAssign} = new {collectionType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat.RemoveMiscellaneousOptions(SymbolDisplayMiscellaneousOptions.IncludeNullableReferenceTypeModifier))}();");
+        WriteCacheAssignment(variableName, variableNameToAssign);
         var iteratorVariableName = NextUniqueVariableName();
         _writer.WriteLine($"foreach(var {iteratorVariableName} in {variableName})");
         _writer.WriteLine(value: '{');
@@ -529,7 +672,8 @@ public class CloneGeneratorClassContext : IDisposable
     private string WriteCollectionClone(string variableName, INamedTypeSymbol collectionType, ITypeSymbol elementType)
     {
         var variableNameToAssign = NextUniqueVariableName();
-        _writer.WriteLine($"{collectionType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)} {variableNameToAssign};");
+        _writer.WriteLine(
+            $"{collectionType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)} {variableNameToAssign};");
         _writer.WriteLine($"if({variableName} is null)");
         _writer.WriteLine(value: '{');
         _writer.Indent++;
@@ -542,6 +686,7 @@ public class CloneGeneratorClassContext : IDisposable
         _writer.WriteLine(
             $"{variableNameToAssign} = new {collectionType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat.RemoveMiscellaneousOptions(SymbolDisplayMiscellaneousOptions.IncludeNullableReferenceTypeModifier))}();"
         );
+        WriteCacheAssignment(variableName, variableNameToAssign);
         var iteratorVariableName = NextUniqueVariableName();
         _writer.WriteLine($"foreach(var {iteratorVariableName} in {variableName})");
         _writer.WriteLine(value: '{');
@@ -566,7 +711,8 @@ public class CloneGeneratorClassContext : IDisposable
             .TrimEnd('[', ']');
         var lengths = new List<string>(arrayType.Rank);
 
-        _writer.WriteLine($"{arrayType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)} {variableNameToAssign};");
+        _writer.WriteLine(
+            $"{arrayType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)} {variableNameToAssign};");
         _writer.WriteLine($"if(ReferenceEquals({variableName}, null))");
         _writer.WriteLine(value: '{');
         _writer.Indent++;
@@ -598,6 +744,8 @@ public class CloneGeneratorClassContext : IDisposable
             .ToList();
 
         _writer.WriteLine(value: ';');
+
+        WriteCacheAssignment(variableName, variableNameToAssign);
 
         for (var i = 0; i < iteratorNames.Count; i++)
         {
@@ -646,26 +794,39 @@ public class CloneGeneratorClassContext : IDisposable
     {
         AddNamespace("System.Linq");
 
-        var assignEnumerableVariable = NextUniqueVariableName();
-        _writer.WriteLine($"var {assignEnumerableVariable} = {variableName};");
-        var countVariable = NextUniqueVariableName();
-        _writer.WriteLine($"_ = {assignEnumerableVariable}.TryGetNonEnumeratedCount(out var {countVariable});");
-        var listVariable = NextUniqueVariableName();
         var elementType = enumerableType.TypeArguments.Single();
         var elementTypeName = elementType.ToDisplayString();
-        _writer.WriteLine($"var {listVariable} = new System.Collections.Generic.List<{elementTypeName}>({countVariable});");
+        var listType = $"System.Collections.Generic.List<{elementTypeName}>";
+        var assignEnumerableVariable = NextUniqueVariableName();
+        _writer.WriteLine($"{listType} {assignEnumerableVariable};");
+        _writer.WriteLine($"if({variableName} is null)");
+        _writer.WriteLine(value: '{');
+        _writer.Indent++;
+        _writer.WriteLine($"{assignEnumerableVariable} = null!;");
+        _writer.Indent--;
+        _writer.WriteLine("}");
+        _writer.WriteLine("else");
+        _writer.WriteLine('{');
+        _writer.Indent++;
+        var countVariable = NextUniqueVariableName();
+        _writer.WriteLine($"{variableName}.TryGetNonEnumeratedCount(out var {countVariable});");
+        _writer.WriteLine($"{assignEnumerableVariable} = new {listType}({countVariable});");
+        WriteCacheAssignment(variableName, assignEnumerableVariable);
         var iteratorVariable = NextUniqueVariableName();
-        _writer.WriteLine($"foreach(var {iteratorVariable} in {assignEnumerableVariable})");
+        _writer.WriteLine($"foreach(var {iteratorVariable} in {variableName})");
         _writer.WriteLine(value: '{');
         _writer.Indent++;
         var resultVariable = WriteCloneLogic(iteratorVariable, elementType);
-        _writer.WriteLine($"{listVariable}.Add({resultVariable});");
+        _writer.WriteLine($"{assignEnumerableVariable}.Add({resultVariable});");
         _writer.Indent--;
         _writer.WriteLine(value: '}');
-        return listVariable;
+        _writer.Indent--;
+        _writer.WriteLine("}");
+        return assignEnumerableVariable;
     }
 
-    private static bool IsDictionaryWithParameterlessConstructor(ITypeSymbol symbol, out ITypeSymbol? keyType, out ITypeSymbol? elementType)
+    private static bool IsDictionaryWithParameterlessConstructor(ITypeSymbol symbol, out ITypeSymbol? keyType,
+        out ITypeSymbol? elementType)
     {
         keyType = null;
         elementType = null;
@@ -675,7 +836,8 @@ public class CloneGeneratorClassContext : IDisposable
             return false;
         }
 
-        if (!namedTypeSymbol.Constructors.Any(c => c.Parameters.Length == 0 && c.DeclaredAccessibility == Accessibility.Public))
+        if (!namedTypeSymbol.Constructors.Any(c =>
+                c.Parameters.Length == 0 && c.DeclaredAccessibility == Accessibility.Public))
         {
             return false;
         }
@@ -704,7 +866,8 @@ public class CloneGeneratorClassContext : IDisposable
             return false;
         }
 
-        if (!namedTypeSymbol.Constructors.Any(c => c.Parameters.Length == 0 && c.DeclaredAccessibility == Accessibility.Public))
+        if (!namedTypeSymbol.Constructors.Any(c =>
+                c.Parameters.Length == 0 && c.DeclaredAccessibility == Accessibility.Public))
         {
             elementType = null;
             return false;
@@ -724,6 +887,7 @@ public class CloneGeneratorClassContext : IDisposable
         elementType = collectionInterface.TypeArguments[index: 0];
         return true;
     }
+
 
     private static bool IsEnumerableType(ITypeSymbol symbol, out INamedTypeSymbol? enumerableType)
     {
@@ -767,8 +931,8 @@ public class CloneGeneratorClassContext : IDisposable
     private static bool HasRequiredMembers(INamespaceOrTypeSymbol symbol)
     {
         return symbol.GetMembers()
-                .Any(member => member is IFieldSymbol { IsRequired: true } or IPropertySymbol { IsRequired: true })
-            || (symbol is ITypeSymbol { BaseType: { } baseType } && HasRequiredMembers(baseType));
+                   .Any(member => member is IFieldSymbol { IsRequired: true } or IPropertySymbol { IsRequired: true })
+               || (symbol is ITypeSymbol { BaseType: { } baseType } && HasRequiredMembers(baseType));
     }
 
     private bool TryInterpretType(ITypeSymbol symbol, out string interpretedType)

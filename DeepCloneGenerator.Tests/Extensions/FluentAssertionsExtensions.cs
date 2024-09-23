@@ -10,7 +10,7 @@ public static class FluentAssertionsExtensions
         return objectAssertions
             .BeEquivalentTo(
                 expected, opt => opt
-                    .Using(new Test())
+                    .Using(new Test()).IgnoringCyclicReferences()
             )
             .And
             .NotBeSameAs(expected);

@@ -51,11 +51,17 @@ public partial class ClassInheritanceTests
             .BeExactClone(original);
     }
 
-    [GenerateDeepClone]
+    [Fact]
+    public void TestWithChildClassWithoutCloneAttribute()
+    {
+        new ChildClassWithoutCloneAttribute().DeepClone().Should().BeOfType<BaseClassWithAutoInheritFalse>();
+    }
+
+    [GenerateDeepClone(AutoInherit = true)]
     private abstract partial class BaseClass
     {
         public required string BaseProperty { get; init; }
-        public abstract string AbstractProperty { get; }
+        public virtual  string AbstractProperty { get; }
     }
 
     private abstract class BaseWithoutAttribute
@@ -71,8 +77,12 @@ public partial class ClassInheritanceTests
         public override string AbstractProperty => "Auto property";
     }
 
-    [GenerateDeepClone]
-    private partial class ParentClass : BaseClass
+    private abstract partial class BaseClass2 : BaseClass
+    {
+
+    }
+
+    private partial class ParentClass : BaseClass2
     {
         public ParentClass(string abstractPropertyValue)
         {
@@ -92,5 +102,14 @@ public partial class ClassInheritanceTests
         }
 
         public required string ParentOfParentProperty { get; init; }
+    }
+
+    [GenerateDeepClone(AutoInherit = false)]
+    private partial class BaseClassWithAutoInheritFalse
+    {
+    }
+
+    private partial class ChildClassWithoutCloneAttribute : BaseClassWithAutoInheritFalse
+    {
     }
 }
